@@ -2,6 +2,7 @@ package jwt
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -42,6 +43,9 @@ type Validator struct {
 
 	// requireExp specifies whether the exp claim is required
 	requireExp bool
+
+	// requireNbf specifies whether the nbf claim is required
+	requireNbf bool
 
 	// verifyIat specifies whether the iat (Issued At) claim will be verified.
 	// According to https://www.rfc-editor.org/rfc/rfc7519#section-4.1.6 this
@@ -110,8 +114,9 @@ func (v *Validator) Validate(claims Claims) error {
 	}
 
 	// We always need to check not-before, but usage of the claim itself is
-	// OPTIONAL.
-	if err = v.verifyNotBefore(claims, now, false); err != nil {
+	// OPTIONAL by default. requireNbf overrides this behavior and makes
+	// the nbf claim mandatory.
+	if err = v.verifyNotBefore(claims, now, v.requireNbf); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -124,7 +129,7 @@ func (v *Validator) Validate(claims Claims) error {
 
 	// If we have an expected audience, we also require the audience claim
 	if len(v.expectedAud) > 0 {
-		if err = v.verifyAudience(claims, v.expectedAud, v.expectAllAud, true); err != nil {
+		if err = v.verifyAudience(claims, v.expectedAud, v.expectAllAud); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -229,52 +234,39 @@ func (v *Validator) verifyNotBefore(claims Claims, cmp time.Time, required bool)
 //
 // Additionally, if any error occurs while retrieving the claim, e.g., when its
 // the wrong type, an ErrTokenUnverifiable error will be returned.
-func (v *Validator) verifyAudience(claims Claims, cmp []string, expectAllAud bool, required bool) error {
+func (v *Validator) verifyAudience(claims Claims, cmp []string, expectAllAud bool) error {
 	aud, err := claims.GetAudience()
 	if err != nil {
 		return err
 	}
 
-	if len(aud) == 0 {
+	// Check that aud exists and is not empty. We only require the aud claim
+	// if we expect at least one audience to be present.
+	if len(aud) == 0 || len(aud) == 1 && aud[0] == "" {
+		required := len(v.expectedAud) > 0
 		return errorIfRequired(required, "aud")
 	}
 
-	// use a var here to keep constant time compare when looping over a number of claims
-	matching := make(map[string]bool, 0)
-
-	// build a matching hashmap out of the expected aud
-	for _, expected := range cmp {
-		matching[expected] = false
-	}
-
-	// compare the expected aud with the actual aud in a constant time manner by looping over all actual values
-	var stringClaims string
-	for _, a := range aud {
-		a := a
-		_, ok := matching[a]
-		if ok {
-			matching[a] = true
+	if !expectAllAud {
+		for _, a := range aud {
+			// If we only expect one match, we can stop early if we find a match
+			if slices.Contains(cmp, a) {
+				return nil
+			}
 		}
 
-		stringClaims = stringClaims + a
+		return ErrTokenInvalidAudience
 	}
 
-	// check if all expected auds are present
-	result := true
-	for _, match := range matching {
-		if !expectAllAud && match {
-			break
-		} else if !match {
-			result = false
+	// Note that we are looping cmp here to ensure that all expected audiences
+	// are present in the aud claim.
+	for _, a := range cmp {
+		if !slices.Contains(aud, a) {
+			return ErrTokenInvalidAudience
 		}
 	}
 
-	// case where "" is sent in one or many aud claims
-	if stringClaims == "" {
-		return errorIfRequired(required, "aud")
-	}
-
-	return errorIfFalse(result, ErrTokenInvalidAudience)
+	return nil
 }
 
 // verifyIssuer compares the iss claim in claims against cmp.
